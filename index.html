@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PanS Game Engine v1.5</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #000; color: #eee; font-family: 'Courier New', Courier, monospace; margin: 0; padding: 0; overflow: hidden; }
+        canvas { background: #1a1a1a; image-rendering: pixelated; display: block; margin: 0 auto; }
+        .hidden { display: none !important; }
+        .fullscreen-viewport { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+        
+        #ui-layer { position: absolute; inset: 0; pointer-events: none; }
+        #cutscene-bar { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); width: 80%; background: rgba(0,0,0,0.9); border: 2px solid #3b82f6; padding: 20px; border-radius: 8px; display: none; pointer-events: auto; }
+        #menu-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.8); display: none; flex-direction: column; align-items: center; justify-content: center; pointer-events: auto; }
+        #fade-overlay { position: absolute; inset: 0; background: black; opacity: 0; transition: opacity 0.5s; pointer-events: none; }
+    </style>
+</head>
+<body class="flex flex-col h-screen">
+
+    <div id="header-bar" class="p-4 border-b border-zinc-800 flex justify-between items-center bg-zinc-900 z-10">
+        <div>
+            <h1 class="text-blue-500 font-bold">PanS_ENGINE::MASTER_v1.2</h1>
+            <p class="text-[10px] text-zinc-500">Lvl: <span id="lvl-path">...</span> | Cam: <span id="cam-coords">0,0</span></p>
+        </div>
+        <div id="status-light" class="w-3 h-3 rounded-full bg-green-500"></div>
+    </div>
+
+    <div id="viewport" class="flex-1 relative bg-black overflow-hidden flex items-center justify-center">
+        <canvas id="stage" width="800" height="450"></canvas>
+        
+        <div id="ui-layer">
+            <div id="fade-overlay"></div>
+            <div id="menu-overlay">
+                <h2 class="text-2xl font-bold mb-4">PAUSED</h2>
+                <button onclick="engine.saveGame()" class="bg-blue-600 px-6 py-2 rounded mb-2">Save Game (M)</button>
+                <button onclick="engine.toggleMenu()" class="text-zinc-400">Resume</button>
+            </div>
+            <div id="cutscene-bar">
+                <div id="speaker" class="text-blue-400 font-bold"></div>
+                <div id="dialogue"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="console-bar" class="h-24 bg-black p-2 text-[11px] overflow-y-auto border-t border-zinc-800 text-green-500">
+        > Engine Heartbeat detected...<br>
+    </div>
+
+<script>
+/**
+ * PanS Parser
+ */
+function parsePanS(text) {
+    if (!text) return null;
+    const data = {};
+    text.split('\n').forEach(line => {
+        const [k, v] = line.split(':').map(s => s?.trim());
+        if (k && v) data[k] = isNaN(v) ? v : parseFloat(v);
+    });
+    return data;
+}
+
+class PanSEngine {
+    constructor(config = {}) {
+        this.canvas = document.getElementById('stage');
+        this.ctx = this.canvas.getContext('2d');
+        this.debugMode = config.debugMode ?? true;
+        this.assetPath = "./Assets/";
+        
+        this.camera = { x: 0, y: 0, lerp: 0.1 };
+        this.player = null;
+        this.lvl = { platforms: [], enemies: [], npcs: [], powerups: [], goal: null, bg: null };
+        this.assetCache = {};
+        this.keys = {};
+        this.spawnPos = { x: 50, y: 50 };
+        
+        // Audio System
+        this.bgm = null;
+        this.currentMusicPath = null;
+
+        // Physics Polish
+        this.coyoteTimer = 0;
+        this.jumpBuffer = 0;
+
+        window.addEventListener('keydown', e => { 
+            this.keys[e.code] = true;
+            if(e.code === 'KeyM') this.toggleMenu();
+            if(e.code === 'KeyE') this.interact();
+            // User interaction to resume audio (browser policy)
+            this.resumeAudio();
+        });
+        window.addEventListener('keyup', e => this.keys[e.code] = false);
+        window.addEventListener('mousedown', () => this.resumeAudio());
+
+        if(!this.debugMode) {
+            document.getElementById('header-bar').classList.add('hidden');
+            document.getElementById('console-bar').classList.add('hidden');
+        }
+
+        this.boot();
+    }
+
+    resumeAudio() {
+        if (this.bgm && this.bgm.paused) {
+            this.bgm.play().catch(() => {});
+        }
+    }
+
+    log(m, c="#22c55e") {
+        if(!this.debugMode) return;
+        const con = document.getElementById('console-bar');
+        con.innerHTML += `> <span style="color:${c}">${m}</span><br>`;
+        con.scrollTop = con.scrollHeight;
+    }
+
+    async boot() {
+        const char = await fetch('./character.PanS').then(r => r.text()).catch(() => null);
+        this.charData = parsePanS(char);
+        await this.loadLevel("Level1");
+        this.loop();
+    }
+
+    async loadLevel(name) {
+        document.getElementById('fade-overlay').style.opacity = 1;
+        this.log(`Loading ${name}...`, "#a855f7");
+        
+        const files = [
+            fetch(`./Levels/${name}/goal.PanS`).then(r => r.text()),
+            ...Array.from({length:10}, (_, i) => fetch(`./Levels/${name}/Platforms/${i}.PanS`).then(r => r.ok ? r.text() : null))
+        ];
+        
+        const results = await Promise.all(files);
+        this.lvl.goal = parsePanS(results[0]);
+        this.lvl.platforms = results.slice(1).map(t => parsePanS(t)).filter(d => d);
+        
+        // Music Handling
+        if (this.lvl.goal && this.lvl.goal.music) {
+            this.playMusic(this.lvl.goal.music);
+        }
+
+        // Pre-load Sprites
+        const sprites = [this.charData.sprite, this.lvl.goal?.sprite, ...this.lvl.platforms.map(p => p.sprite)].filter(s => s);
+        await Promise.all(sprites.map(s => this.loadAsset(s)));
+
+        this.spawnPlayer();
+        document.getElementById('lvl-path').innerText = name;
+        setTimeout(() => document.getElementById('fade-overlay').style.opacity = 0, 500);
+    }
+
+    playMusic(filename) {
+        const path = this.assetPath + filename;
+        if (this.currentMusicPath === path) return; // Don't restart if already playing
+
+        if (this.bgm) {
+            this.bgm.pause();
+            this.bgm = null;
+        }
+
+        this.bgm = new Audio(path);
+        this.bgm.loop = true;
+        this.currentMusicPath = path;
+        this.bgm.play().catch(e => {
+            this.log("Audio blocked. Press any key to start music.", "#fbbf24");
+        });
+    }
+
+    async loadAsset(s) {
+        if (this.assetCache[s]) return;
+        return new Promise(res => {
+            const i = new Image();
+            i.onload = () => { this.assetCache[s] = i; res(); };
+            i.src = this.assetPath + s;
+        });
+    }
+
+    spawnPlayer() {
+        this.player = { ...this.charData, x: 50, y: 50, vx: 0, vy: 0, grounded: false, facing: 1 };
+    }
+
+    update() {
+        if (!this.player || this.menuActive) return;
+        const p = this.player;
+
+        // X Movement
+        if (this.keys['ArrowRight']) { p.vx = p.speed; p.facing = 1; }
+        else if (this.keys['ArrowLeft']) { p.vx = -p.speed; p.facing = -1; }
+        else p.vx *= 0.8;
+
+        // Coyote Time (allow jump for 6 frames after leaving edge)
+        if (p.grounded) this.coyoteTimer = 6; else this.coyoteTimer--;
+
+        // Jump Buffering (remember jump press for 6 frames)
+        if (this.keys['Space'] || this.keys['ArrowUp']) this.jumpBuffer = 6; else this.jumpBuffer--;
+
+        if (this.jumpBuffer > 0 && this.coyoteTimer > 0) {
+            p.vy = p.jump;
+            p.grounded = false;
+            this.jumpBuffer = 0;
+            this.coyoteTimer = 0;
+        }
+
+        p.vy += p.gravity;
+        p.x += p.vx;
+        p.y += p.vy;
+        p.grounded = false;
+
+        // Collisions
+        this.lvl.platforms.forEach(plat => {
+            if (p.x < plat.x + plat.w && p.x + p.w > plat.x && p.y < plat.y + plat.h && p.y + p.h > plat.y) {
+                if (p.vy >= 0 && (p.y + p.h - p.vy) <= plat.y) {
+                    p.y = plat.y - p.h; p.vy = 0; p.grounded = true;
+                }
+            }
+        });
+
+        // Camera Follow (Smooth Lerp)
+        let targetX = p.x - this.canvas.width / 2;
+        this.camera.x += (targetX - this.camera.x) * this.camera.lerp;
+        document.getElementById('cam-coords').innerText = `${Math.floor(this.camera.x)}, 0`;
+    }
+
+    draw() {
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        this.ctx.save();
+        this.ctx.translate(-this.camera.x, 0); // Apply Camera
+
+        // Draw Platforms
+        this.lvl.platforms.forEach(plat => {
+            if(plat.sprite) this.ctx.drawImage(this.assetCache[plat.sprite], plat.x, plat.y, plat.w, plat.h);
+            else { this.ctx.fillStyle="#444"; this.ctx.fillRect(plat.x, plat.y, plat.w, plat.h); }
+        });
+
+        // Draw Player
+        const p = this.player;
+        this.ctx.fillStyle = "#3b82f6";
+        if(p.sprite) this.ctx.drawImage(this.assetCache[p.sprite], p.x, p.y, p.w, p.h);
+        else this.ctx.fillRect(p.x, p.y, p.w, p.h);
+
+        this.ctx.restore();
+    }
+
+    loop() {
+        this.update();
+        this.draw();
+        requestAnimationFrame(() => this.loop());
+    }
+
+    toggleMenu() { this.menuActive = !this.menuActive; document.getElementById('menu-overlay').style.display = this.menuActive ? 'flex' : 'none'; }
+}
+
+const engine = new PanSEngine({ debugMode: true });
+</script>
+</body>
+</html>
+
